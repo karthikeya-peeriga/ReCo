@@ -143,21 +143,34 @@ class augTextDataset(Dataset):
         with open(code_gen_path, 'r') as f:
             code_gen_aug = json.load(f)
             code_gen_aug = code_gen_aug[phase]
+
+        # Ensure we have enough examples by repeating the last examples if needed
+        target_length = len(query_gen_aug) + (args.max_n_gen - (len(query_gen_aug) % args.max_n_gen))
+        while len(query_gen_aug) < target_length:
+            query_gen_aug.append(query_gen_aug[-1])
+            code_gen_aug.append(code_gen_aug[-1])
+
         assert len(query_gen_aug) == len(code_gen_aug)
+
         for i in range(len(query_gen_aug)):
             js = {'query': query_gen_aug[i], 'code': code_gen_aug[i]}
             self.data.append(js)
-
-        for js in self.data:
-            self.examples.append(convert_examples_to_features(js,tokenizer,args))
+            self.examples.append(convert_examples_to_features(js, tokenizer, args))
 
     def __len__(self):
-        return len(self.examples) // self.args.n_gen
+        return len(self.examples) // self.args.max_n_gen
 
-    def __getitem__(self, i):
-        return (torch.tensor(self.examples[i].code_ids),torch.tensor(self.examples[i].nl_ids))
+    def get_augmented_examples(self, index, n_gen):
+        """Helper method to safely get n_gen examples for a given index"""
+        base_idx = index * self.args.max_n_gen
+        examples = []
+        for j in range(n_gen):
+            if base_idx + j < len(self.examples):
+                examples.append(self.examples[base_idx + j])
+            else:
+                examples.append(self.examples[-1])  # Use last example if out of range
+        return examples
 
-            
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -265,58 +278,66 @@ def train(args, model, tokenizer, config):
 
 
 def evaluate(args, model, tokenizer, config):
+    # Initialize datasets
     test_dataset = TextDataset(tokenizer, args, phase='test')
     test_sampler = SequentialSampler(test_dataset)
     test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.eval_batch_size, num_workers=4)
 
-    aug_dataset = augTextDataset(tokenizer, args, phase='test', query_gen_path=args.query_gen_path,
-                               code_gen_path=args.code_gen_path)
+    aug_dataset = augTextDataset(tokenizer, args, phase='test',
+                                 query_gen_path=args.query_gen_path,
+                                 code_gen_path=args.code_gen_path)
 
-    # Eval!
     logger.info("***** Running evaluation *****")
-    logger.info("  Num data = %d", len(test_dataset))
+    logger.info("  Num examples = %d", len(test_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
 
     model.eval()
     code_vecs = []
     nl_vecs = []
+
     for batch in test_dataloader:
         code_inputs = batch[0].to(args.device)
         nl_inputs = batch[1].to(args.device)
+        aug_indices = batch[2]
+
         with torch.no_grad():
             nl_vec = model(nl_inputs=nl_inputs)
             code_vec = model(code_inputs=code_inputs)
 
-        aug_index = batch[2]
-        if args.augcode:
-            code_inputs = torch.cat(
-                [torch.tensor(aug_dataset.examples[i * args.max_n_gen + j].code_ids).unsqueeze(0) for i in aug_index for j in
-                 range(args.n_gen)], dim=0).to(args.device)
-            with torch.no_grad():
-                code_vec2 = model(code_inputs=code_inputs)
-                code_vec2 = code_vec2.view(batch[1].size(0), args.n_gen, config.hidden_size)
-                code_vec = torch.mean(torch.cat([code_vec.unsqueeze(1).repeat(1, args.n_gen, 1), code_vec2], dim=1), dim=1)
+            if args.augcode:
+                code_aug_tensors = []
+                for idx in aug_indices:
+                    aug_examples = aug_dataset.get_augmented_examples(idx.item(), args.n_gen)
+                    for example in aug_examples:
+                        code_aug_tensors.append(torch.tensor(example.code_ids).unsqueeze(0))
 
-        if args.augquery:
-            nl_inputs = torch.cat(
-                [torch.tensor(aug_dataset.examples[i * args.max_n_gen + j].nl_ids).unsqueeze(0) for i in aug_index for j in
-                 range(args.n_gen)], dim=0).to(args.device)
-            with torch.no_grad():
-                nl_vec2 = model(nl_inputs=nl_inputs)
-                nl_vec2 = nl_vec2.view(batch[1].size(0), args.n_gen, config.hidden_size)
+                code_inputs_aug = torch.cat(code_aug_tensors, dim=0).to(args.device)
+                code_vec2 = model(code_inputs=code_inputs_aug)
+                code_vec2 = code_vec2.view(len(aug_indices), args.n_gen, config.hidden_size)
+                code_vec = torch.mean(torch.cat([code_vec.unsqueeze(1).repeat(1, args.n_gen, 1), code_vec2], dim=1),
+                                      dim=1)
+
+            if args.augquery:
+                nl_aug_tensors = []
+                for idx in aug_indices:
+                    aug_examples = aug_dataset.get_augmented_examples(idx.item(), args.n_gen)
+                    for example in aug_examples:
+                        nl_aug_tensors.append(torch.tensor(example.nl_ids).unsqueeze(0))
+
+                nl_inputs_aug = torch.cat(nl_aug_tensors, dim=0).to(args.device)
+                nl_vec2 = model(nl_inputs=nl_inputs_aug)
+                nl_vec2 = nl_vec2.view(len(aug_indices), args.n_gen, config.hidden_size)
                 nl_vec = torch.mean(torch.cat([nl_vec.unsqueeze(1).repeat(1, args.n_gen, 1), nl_vec2], dim=1), dim=1)
 
         nl_vecs.append(nl_vec.cpu().numpy())
         code_vecs.append(code_vec.cpu().numpy())
 
-
     model.train()
-    code_vecs = np.concatenate(code_vecs,0)
-    nl_vecs = np.concatenate(nl_vecs,0)
-    
-    scores = np.matmul(nl_vecs,code_vecs.T)
-    
-    sort_ids = np.argsort(scores, axis=-1, kind='quicksort', order=None)[:,::-1]
+    code_vecs = np.concatenate(code_vecs, 0)
+    nl_vecs = np.concatenate(nl_vecs, 0)
+
+    scores = np.matmul(nl_vecs, code_vecs.T)
+    sort_ids = np.argsort(scores, axis=-1, kind='quicksort', order=None)[:, ::-1]
 
     ranks = []
     for idx in range(len(scores)):
@@ -328,7 +349,6 @@ def evaluate(args, model, tokenizer, config):
     }
 
     return result
-
 
 def main():
     parser = argparse.ArgumentParser()
