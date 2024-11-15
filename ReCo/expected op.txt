@@ -1,0 +1,32 @@
+***** Running evaluation *****
+Num examples = 500
+Batch size = 64
+
+***** Eval results *****
+eval_mrr = X.XXX
+
+
+
+output/
+    checkpoint-best-mrr/  (only created during training)
+        model.bin         (only created during training)
+
+
+MRR = 1.0 means perfect matching (best possible score)
+MRR = 0.5 might indicate the correct code is typically found in the top 2 results
+MRR = 0.25 might indicate the correct code is typically found in the top 4 results
+
+
+
+ had a conflict because --output_dir was being defined twice in your script.
+The argparse module doesn't allow duplicate argument names, so it raises an ArgumentError.
+
+
+
+The script uses the `argparse` library to parse command-line arguments, allowing for customizable input when running the model. It loads the pre-trained model, specified by the `--model_name_or_path` argument, and sets various parameters like the length of code and natural language inputs, batch size, and seed. It also defines paths for input datasets (`--query_gen_path`, `--code_gen_path`) and configures whether to use augmentation techniques for queries and code. The script then performs evaluation on the provided dataset, using the model to generate and evaluate code samples according to the specified configurations. Finally, it saves the output (e.g., model checkpoints) to a specified directory.
+
+about 6-8 hours to run on a laptop due to perf restrictions, preferred tech is rtx 3080 or equivalent gpu. 
+
+
+for my config, processes each batch in 2-4 minutes, best case run time = 2*64 minutes, worst case run time = 4*64, 
+
